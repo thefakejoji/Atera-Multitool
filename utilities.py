@@ -1,221 +1,241 @@
-import tkinter as tk
-from tkinter import ttk
-from utilities import *
-import scripts  # Import the scripts module
+import os
+import sys
+import winreg
+import win32api
+import win32service
+import win32serviceutil
+import platform
+import ssl
+import subprocess
+import tempfile
+import glob
+from scripts import *
 
-# List of possible log locations
-LOG_PATHS = [
-    r"C:\Program Files\ATERA Networks\AteraAgent\Agent\logs",  # Always exists
-    r"C:\Program Files\ATERA Networks\AteraAgent\Agent\packages\AgentPackageMonitoring",
-    r"C:\Program Files\ATERA Networks\AteraAgent\Agent\packages\AgentPackageSystemTools",
-    r"C:\Program Files\ATERA Networks\AteraAgent\Agent\packages\AgentPackageOsUpdates",
-    r"C:\Program Files\ATERA Networks\AteraAgent\Agent\packages\AgentPackageInternalPoller",
-]
+def get_resource_path(relative_path):
+    """ Get the absolute path to a resource, works for dev and PyInstaller """
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)  # For PyInstaller bundle
+    return os.path.join(os.path.abspath("."), relative_path)  # For normal script execution
 
-def execute_script(script_name):
-    """Fetch the script content from scripts.py, run it, and update the text widget."""
+def export_info():
+    # Gather information from other functions
+    os_info = get_os_info()
+    agent_version = get_agent_version()
+    agent_service = get_agent_service()
+    accountid = get_account_id()
+    ssl_version = get_ssl_version()
+    tls_version = get_tls_version()
+    fips = get_fips()
+    net_version = get_net_version()
+    core_version = get_core_version()
+
+    # Prepare the content to write to the file
+    content = f"""
+    OS Information: {os_info}
+    Agent Version: {agent_version}
+    Agent Service: {agent_service}
+    AccountID: {accountid}
+    SSL Version: {ssl_version}
+    TLS Version: {tls_version}
+    FIPS status: {fips}
+    .NET Framework Version: {net_version}
+    .NET Core Versions: {core_version}
+    """
+
+    # Write to the file
+    with open("log.txt", "w") as file:
+        file.write(content)
+
+
+def get_agent_version():
+    agent_path = r"C:\Program Files\ATERA Networks\AteraAgent\Agent\AteraAgent.exe"
     
-    # Dynamically retrieve the script content using getattr
-    script_content = getattr(scripts, script_name, None)  
-    
-    if script_content:
-        result = run_script(script_content)  # Run the actual script content
+    if os.path.exists(agent_path):
+        info = win32api.GetFileVersionInfo(agent_path, "\\")
+        ms = info['FileVersionMS']
+        ls = info['FileVersionLS']
+        version = f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+        return version
     else:
-        result = f"Error: Script '{script_name}' not found in scripts.py"
+        return "Agent not found"
+
+def get_agent_service():
+    service_name = "AteraAgent"
     
-    feedback_text.delete(1.0, tk.END)  # Clear previous output
-    feedback_text.insert(tk.END, result)  # Insert new output
+    try:
+        # Check if the service exists
+        if not win32serviceutil.QueryServiceStatus(service_name):
+            return "Service not found"
 
-def create_log_tabs(parent_tab):
-    """Dynamically create log tabs based on available logs."""
-    log_notebook = ttk.Notebook(parent_tab)
-    log_notebook.pack(expand=True, fill="both")
+        # Open the service manager
+        hscm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+        hs = win32service.OpenService(hscm, service_name, win32service.SERVICE_QUERY_CONFIG)
 
-    log_found = False
+        # Get service configuration
+        config = win32service.QueryServiceConfig(hs)
+        win32service.CloseServiceHandle(hs)
+        win32service.CloseServiceHandle(hscm)
 
-    for log_folder in LOG_PATHS:
-        log_file = find_latest_log(log_folder)
-        if log_file:
-            log_found = True
-            log_name = os.path.basename(os.path.dirname(log_file))
-            if log_name == "logs":
-                log_name = "Agent log"
+        # The service user is stored in config[7]
+        return config[7]  # This returns the user the service runs as
 
-            log_tab = ttk.Frame(log_notebook)
-            log_notebook.add(log_tab, text=log_name)
+    except Exception as e:
+        return f"Error retrieving service info: {e}"
 
-            scrollbar = tk.Scrollbar(log_tab, orient="vertical")
-            scrollbar.pack(side="right", fill="y")
+def get_account_id():
+    try:
+        # Open the registry key for the Atera agent settings
+        reg_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\ATERA Networks\AlphaAgent")
+        
+        # Try to read the value of AccountId
+        value, _ = winreg.QueryValueEx(reg_key, "AccountId")
+        
+        # Check if the value is None (equivalent to null in other languages)
+        if value is not None:
+            return value
+        else:
+            return "AccountId is empty"
+    except FileNotFoundError:
+        return "Key not found, Agent might not be installed"
+    except Exception as e:
+        return f"Unable to read due to: {e}"
 
-            log_text = tk.Text(log_tab, wrap="word", yscrollcommand=scrollbar.set)
-            log_text.pack(fill="both", expand=True)
-            scrollbar.config(command=log_text.yview)
 
-            log_content = read_log_file(log_file)
-            log_text.insert(tk.END, log_content)
+def get_os_info():
+    try:
+        # Get OS version and architecture
+        os_version = platform.version()  # Example: "10.0.22631"
+        arch = platform.architecture()[0]  # Example: "64bit"
 
-    if not log_found:
-        label = ttk.Label(parent_tab, text="No log files found.", font=("Arial", 12))
-        label.pack(pady=20)
+        # Get Windows product name (e.g., "Windows 11 Pro", "Windows Server 2019")
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+            product_name, _ = winreg.QueryValueEx(key, "ProductName")  # Gets full Windows name
+            edition, _ = winreg.QueryValueEx(key, "EditionID")  # Gets "Professional", "Enterprise", etc.
 
+        # If it's a Windows Server, return the full product name
+        if "Server" in product_name:
+            return f"{product_name} {os_version} {arch}"
 
-# Create the main window
-root = tk.Tk()
-root.title("Atera Multitool")
-logo = tk.PhotoImage(file="ateralogo.png")
-root.iconphoto(False, logo)
-root.geometry("950x500")  # Set window size
+        # Otherwise, detect Windows 10/11 based on the build number
+        win_version = sys.getwindowsversion()
+        major_version = win_version.major  # 10 for Win10, 11 for Win11
 
-# Define the Notebook (tabs)
-tabs = ttk.Notebook(root)
-tabs.pack(expand=True, fill="both")
+        if major_version == 10 and win_version.build >= 22000:
+            major_version = 11  # Windows 11 starts from build 22000
 
-tab1 = ttk.Frame(tabs)
-tabs.add(tab1, text="Agent Information")
+        return f"Windows {major_version} {edition} {os_version} {arch}"
 
-tab2 = ttk.Frame(tabs)
-tabs.add(tab2, text="Agent Actions")
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-tab3 = ttk.Frame(tabs)
-tabs.add(tab3, text = "Log Exceptions")
+def get_ssl_version():
+    return ssl.OPENSSL_VERSION
 
-tab4 = ttk.Frame(tabs)
-tabs.add(tab4, text = "Read me!")
+def get_tls_version():
+    try:
+        supported_versions = []
+        
+        # Checking each TLS version
+        if hasattr(ssl, "TLSVersion"):
+            if ssl.TLSVersion.TLSv1_1 in ssl.TLSVersion:
+                supported_versions.append("TLS 1.1")
+            if ssl.TLSVersion.TLSv1_2 in ssl.TLSVersion:
+                supported_versions.append("TLS 1.2")
+            if ssl.TLSVersion.TLSv1_3 in ssl.TLSVersion:
+                supported_versions.append("TLS 1.3")
 
-# Tab Frames
-###############################################
+        return f"{', '.join(supported_versions)}" if supported_versions else "No TLS versions detected"
+    
+    except Exception as e:
+        return f"Error detecting TLS: {str(e)}"
 
-# Tab 1 Frames
+def get_fips():
+    try:
+        # Open the registry key for FIPS settings
+        reg_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"System\CurrentControlSet\Control\Lsa")
+        
+        # Try to read the value of FIPSAlgorithmPolicy
+        value, _ = winreg.QueryValueEx(reg_key, "FIPSAlgorithmPolicy")
+        
+        # Check the value of FIPSAlgorithmPolicy (1 = enabled, 0 = disabled)
+        if value == 1:
+            return "Enabled"
+        else:
+            return "Disabled"
+    except FileNotFoundError:
+        return "Undefined(not enabled)"
+    except Exception as e:
+        return f"Error checking FIPS mode: {e}"
 
-agent_inf_frame = tk.Frame(tab1, bd=1, relief="solid")
-agent_inf_frame.pack(side="left", fill="both", expand=True)
+def get_net_version():
+    try:
+        reg_path = r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path) as key:
+            release, _ = winreg.QueryValueEx(key, "Release")
 
-os_inf_frame = tk.Frame(tab1, bd=1, relief="solid")
-os_inf_frame.pack(side="right", fill="both", expand=True)
+        # Mapping release keys to .NET versions
+        net_versions = {378389: "4.5", 378675: "4.5.1", 378758: "4.5.1", 379893: "4.5.2", 393295: "4.6", 
+                393297: "4.6", 394254: "4.6.1", 394271: "4.6.1", 394802: "4.6.2", 394806: "4.6.2",
+                460798: "4.7", 460805: "4.7", 461308: "4.7.1", 461310: "4.7.1", 461808: "4.7.2",
+                461814: "4.7.2", 528040: "4.8", 533320: "4.8.1", 539379: "4.8.1"}
 
-# Tab 2 Frames
+        return net_versions.get(release, f"Unknown version (Release {release})")
 
-action_buttons_frame = tk.Frame(tab2, bd=1, relief="solid")
-action_buttons_frame.pack(side = "top", fill= "x", expand = False)
+    except FileNotFoundError:
+        return ".NET Framework not installed"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-action_feedbacks = tk.Frame(tab2, bd = 1, relief = "solid")
-action_feedbacks.pack(side = "bottom", fill= "both", expand = True )
+def get_core_version():
+    net_core_path = r"C:\Program Files\dotnet\shared\Microsoft.NETCore.App"
+    if os.path.exists(net_core_path):
+        return os.listdir(net_core_path)  # List of installed .NET Core versions
+    else:
+        return "No .NET Core found"
 
-# Tab 3's nested tabs
+def run_script(script_content):
+    try:
+        # Create a temporary PowerShell script file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ps1", mode="w", encoding="utf-8") as temp_script:
+            temp_script.write(script_content)
+            temp_script_path = temp_script.name  # Store file path
 
-create_log_tabs(tab3)
+        # Run the script using PowerShell and capture raw output
+        process = subprocess.run(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-File", temp_script_path],
+            capture_output=True, text=True, shell=True
+        )
 
-# Tab 4 text widget
+        # Cleanup: Delete the temp script file
+        os.remove(temp_script_path)
 
-info_frame = tk.Frame(tab4, bd=1, relief="solid")
-info_frame.pack(fill="both", expand=True)
+        # Return raw output exactly as PowerShell provides it
+        return process.stdout + process.stderr
 
-info_scrollbar = tk.Scrollbar(info_frame, orient="vertical")
-info_scrollbar.pack(side="right", fill="y")
+    except Exception as e:
+        return f"Exception: {str(e)}"
 
-# Contents and Buttons
-###############################################
+def find_latest_log(log_folder):
+    """Find the latest log file in the given folder."""
+    if not os.path.exists(log_folder):
+        return None  # Skip if folder does not exist
 
-# Tab 1's buttons and stuffs
+    rotating_logs = glob.glob(os.path.join(log_folder, "log.*.txt"))
+    rotating_logs.sort(reverse=True)  # Sort by date (latest first)
 
-# Agent Info labels
-# Label to display the Agent version
-version_text = tk.StringVar(value=f"Agent version: {get_agent_version()}")
-version_label = ttk.Label(agent_inf_frame, textvariable=version_text, anchor="w", font=("Arial", 12))
-version_label.pack(padx=10, pady=10, anchor="w")  # Moved padding to pack()
+    if rotating_logs:
+        return rotating_logs[0]  # Return latest rotating log
+    elif os.path.exists(os.path.join(log_folder, "log.txt")):
+        return os.path.join(log_folder, "log.txt")  # Fallback to log.txt
+    return None  # No logs found
 
-# Label o display the Service's Run As user
-service_text = tk.StringVar(value=f"Service user: {get_agent_service()}")
-service_label = ttk.Label(agent_inf_frame, textvariable=service_text, anchor="w", font=("Arial", 12))
-service_label.pack(padx=10, pady=10, anchor="w")
-
-# Label to display AccountID
-account_id_text = tk.StringVar(value=f"Account ID: {get_account_id()}")
-account_id_label = ttk.Label(agent_inf_frame, textvariable=account_id_text, anchor="w", font=("Arial", 12))
-account_id_label.pack(padx=10, pady=10, anchor="w")
-
-# OS info labels
-# Label to display the OS version
-os_inf_text = tk.StringVar(value=get_os_info())
-os_inf_label = ttk.Label(os_inf_frame, textvariable=os_inf_text, anchor="w", font=("Arial", 12))
-os_inf_label.pack(padx=10, pady=10, anchor="w")
-
-# SSL Version Label
-ssl_version_text = tk.StringVar(value=f"SSL Version: {get_ssl_version()}")
-ssl_version_label = ttk.Label(os_inf_frame, textvariable=ssl_version_text, anchor="w", font=("Arial", 12))
-ssl_version_label.pack(padx=10, pady=5, anchor="w")
-
-# TLS Version Label
-tls_version_text = tk.StringVar(value=f"TLS Version: {get_tls_version()}")
-tls_version_label = ttk.Label(os_inf_frame, textvariable=tls_version_text, anchor="w", font=("Arial", 12))
-tls_version_label.pack(padx=10, pady=5, anchor="w")
-
-# FIPS enable check
-fips_enable = tk.StringVar(value=f"FIPS: {get_fips()}")
-fips_enable_label = ttk.Label(os_inf_frame, textvariable=fips_enable, anchor="w", font=("Arial", 12))
-fips_enable_label.pack(padx=10, pady=5, anchor="w")
-
-# .NET Framework Version Label
-net_version_text = tk.StringVar(value=f".NET Framework: {get_net_version()}")
-net_version_label = ttk.Label(os_inf_frame, textvariable=net_version_text, anchor="w", font=("Arial", 12))
-net_version_label.pack(padx=10, pady=5, anchor="w")
-
-# .NET Core Versions Label
-core_versions = get_core_version()
-core_version_text = tk.StringVar(value=f".NET Core Versions: {', '.join(core_versions) if isinstance(core_versions, list) else core_versions}")
-core_version_label = ttk.Label(os_inf_frame, textvariable=core_version_text, anchor="w", font=("Arial", 12))
-core_version_label.pack(padx=10, pady=5, anchor="w")
-
-export_button = tk.Button( os_inf_frame, text= "Export all", command = export_info, activeforeground="lightgray", disabledforeground="white", anchor =  "center")
-export_button.pack(side = "bottom", fill="x", padx=10, pady=10)
-
-# Tab 2's buttons and stuffs
-
-run_connection = tk.Button(action_buttons_frame, text= "Check connections", command=lambda: execute_script("script_connection"), activeforeground="lightgray", disabledforeground="white", anchor = "w")
-run_connection.pack(side = "left", padx=1, pady=1)
-
-run_packages = tk.Button(action_buttons_frame, text= "Check package availability", command=lambda: execute_script("script_packages"), activeforeground="lightgray", disabledforeground="white", anchor = "w")
-run_packages.pack(side = "left", padx=1, pady=1)
-
-run_cleanup = tk.Button(action_buttons_frame, text= "Run cleanup", command=lambda: execute_script("script_cleanup"), activeforeground="lightgray", disabledforeground="white", anchor = "w")
-run_cleanup.pack(side = "left", padx=1, pady=1)
-
-run_splashtop = tk.Button(action_buttons_frame, text= "Remove Splashtop", command=lambda: execute_script("script_splashtop"), activeforeground="lightgray", disabledforeground="white", anchor = "w")
-run_splashtop.pack(side = "left", padx=1, pady=1)
-
-run_ndiscovery = tk.Button(action_buttons_frame, text= "Remove N.Discovery", command=lambda: execute_script("script_ndiscovery"), activeforeground="lightgray", disabledforeground="white", anchor = "w")
-run_ndiscovery.pack(side = "left", padx=1, pady=1)
-
-run_helpdesk = tk.Button(action_buttons_frame, text= "Remove Helpdesk Agent", command=lambda: execute_script("script_helpdesk"), activeforeground="lightgray", disabledforeground="white", anchor = "w")
-run_helpdesk.pack(side = "left", padx=1, pady=1)
-
-run_sccm = tk.Button(action_buttons_frame, text= "Remove SCCM", command=lambda: execute_script("script_sccm"), activeforeground="lightgray", disabledforeground="white", anchor = "w")
-run_sccm.pack(side = "left", padx=1, pady=1)
-
-run_notifs = tk.Button(action_buttons_frame, text= "Fix Reboot Notifications", command=lambda: execute_script("script_rebootnotify"), activeforeground="lightgray", disabledforeground="white", anchor = "w")
-run_notifs.pack(side = "left", padx=1, pady=1)
-
-# Text widget and scrollbar
-scrollbar = tk.Scrollbar(action_feedbacks, orient="vertical")
-scrollbar.pack(side="right", fill="y")
-
-feedback_text = tk.Text(action_feedbacks, wrap="word", yscrollcommand=scrollbar.set)
-feedback_text.pack(fill="both", expand=True)
-
-scrollbar.config(command=feedback_text.yview)
-
-#Tab 4's widgets
-
-info_text = tk.Text(info_frame, wrap="word", yscrollcommand=info_scrollbar.set, font=("Arial", 11))
-info_text.pack(fill="both", expand=True)
-
-# Insert the disclaimer text and set it to read-only
-info_text.insert("1.0", disclaimer)
-info_text.config(state="disabled")  # Make the text read-only
-
-# Link scrollbar to text widget
-info_scrollbar.config(command=info_text.yview)
-
-# End
-# Run the application
-root.mainloop()
+def read_log_file(log_path):
+    """Read and filter the log file, removing [INF] and Info: lines."""
+    try:
+        with open(log_path, "r", encoding="utf-8") as file:
+            lines = file.readlines()
+        
+        error_lines = [line for line in lines if "[INF]" not in line and "Info:" not in line]
+        return "".join(error_lines) if error_lines else "No errors or exceptions found."
+    except Exception as e:
+        return f"Error reading log file: {e}"
