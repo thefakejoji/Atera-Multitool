@@ -62,9 +62,11 @@ def create_log_tabs(parent_tab):
 # Create the main window
 root = tk.Tk()
 root.title("Atera Multitool")
-logo = tk.PhotoImage(file="ateralogo.png")
-root.iconphoto(False, logo)
 root.geometry("950x500")  # Set window size
+
+logo_path = get_resource_path("ateralogo.png")
+logo = tk.PhotoImage(file=logo_path)
+root.iconphoto(False, logo)
 
 # Define the Notebook (tabs)
 tabs = ttk.Notebook(root)
